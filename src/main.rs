@@ -14,8 +14,7 @@ struct State {
     // it gets dropped after it as the surface contains
     // unsafe references to the window's resources.
     window: Window,
-    render_pipelines: [wgpu::RenderPipeline; 2],
-    selected_pipeline: usize,
+    render_pipeline: wgpu::RenderPipeline,
 }
 
 impl State {
@@ -82,10 +81,6 @@ impl State {
             label: Some("Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
-        let shader2 = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shader2.wgsl").into()),
-        });
 
         let render_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -94,7 +89,7 @@ impl State {
                 push_constant_ranges: &[],
             });
 
-        let render_pipeline_1 = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Render Pipeline"),
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
@@ -129,41 +124,6 @@ impl State {
             multiview: None,
         });
 
-        let render_pipeline_2 = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline 2"),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader2,
-                entry_point: "vs_main",
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader2,
-                entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None, // 1.
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
-        });
-
         Self {
             window,
             surface,
@@ -171,8 +131,7 @@ impl State {
             queue,
             config,
             size,
-            render_pipelines: [render_pipeline_1, render_pipeline_2],
-            selected_pipeline: 0,
+            render_pipeline,
         }
     }
 
@@ -186,23 +145,6 @@ impl State {
     }
 
     fn input(&mut self, event: &WindowEvent) -> bool {
-        match event {
-            WindowEvent::KeyboardInput {
-                device_id,
-                input,
-                is_synthetic,
-            } => match input.virtual_keycode {
-                Some(VirtualKeyCode::Space) => {
-                    if self.selected_pipeline == 0 {
-                        self.selected_pipeline = 1;
-                    } else {
-                        self.selected_pipeline = 0;
-                    }
-                }
-                _ => (),
-            },
-            _ => (),
-        }
         false
     }
 
@@ -239,8 +181,9 @@ impl State {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-            render_pass.set_pipeline(&self.render_pipelines[self.selected_pipeline]);
+            render_pass.set_pipeline(&self.render_pipeline);
             render_pass.draw(0..3, 0..1);
+            glDrawArrays(3);
         }
 
         // submit will accept anything that implements IntoIter
