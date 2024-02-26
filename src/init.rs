@@ -1,5 +1,6 @@
 mod window_init;
 
 pub fn initialize(){
-    window_init::init_window();
+    env_logger::init();
+    pollster::block_on(window_init::init_window());
 }
