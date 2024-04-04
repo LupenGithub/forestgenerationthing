@@ -14,3 +14,4 @@ pollster = "0.3.0"
 bytemuck = { version = "1.12", features = [ "derive" ] }
 image = { version = "0.24", features = ["png", "jpeg"], default-features = false }
 anyhow = "1.0.80"
+cgmath = "0.18"
