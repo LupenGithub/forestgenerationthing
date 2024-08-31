@@ -1,222 +1,92 @@
-use std::{f32::consts::FRAC_PI_2, time::Duration};
-
-use cgmath::{perspective, InnerSpace, Matrix4, Point3, Rad, SquareMatrix, Vector3};
+use camera::{Camera, CameraController, CameraUniform, Projection};
+use cgmath::{Point3, Rad};
 use noise::{NoiseFn, Perlin};
 use wgpu::util::DeviceExt;
 use winit::{
-    dpi::{PhysicalPosition, PhysicalSize},
-    event::{
-        DeviceEvent, ElementState, Event, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent,
-    },
+    dpi::PhysicalSize,
+    event::{DeviceEvent, ElementState, Event, KeyEvent, MouseButton, WindowEvent},
     event_loop::EventLoop,
-    keyboard::{KeyCode, PhysicalKey},
+    keyboard::PhysicalKey,
     window::{Window, WindowBuilder},
 };
+
+mod camera;
 mod texture;
 mod vertex;
 use texture::Texture;
 use vertex::Vertex;
 
-#[rustfmt::skip]
-pub const OPENGL_TO_WGPU_MATRIX: cgmath::Matrix4<f32> = cgmath::Matrix4::new(
-    1.0, 0.0, 0.0, 0.0,
-    0.0, 1.0, 0.0, 0.0,
-    0.0, 0.0, 0.5, 0.5,
-    0.0, 0.0, 0.0, 1.0,
-);
-
-pub struct Camera {
-    pub position: Point3<f32>,
-    yaw: Rad<f32>,
-    pitch: Rad<f32>,
+struct Chunk {
+    vertices: Vec<Vertex>,
+    indices: Vec<u32>,
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    position_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    pos: [f32; 3],
 }
 
-struct Projection {
-    aspect: f32,
-    fovy: Rad<f32>,
-    znear: f32,
-    zfar: f32,
-}
+impl Chunk {
+    fn get_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+            label: Some("position_bind_group_layout"),
+        })
+    }
 
-impl Camera {
-    pub fn new<V: Into<Point3<f32>>, Y: Into<Rad<f32>>, P: Into<Rad<f32>>>(
-        position: V,
-        yaw: Y,
-        pitch: P,
-    ) -> Self {
+    fn new(heightmap: &Vec<Vec<f32>>, pos: [f32; 3], device: &wgpu::Device) -> Self {
+        let now = std::time::Instant::now();
+        let (vertices, indices) = create_mesh(&heightmap);
+        println!("meshing time: {:?}", now.elapsed());
+        let now = std::time::Instant::now();
+
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Chunk Vertex Buffer"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Chunk Index Buffer"),
+            contents: bytemuck::cast_slice(&indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        let position_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Position Buffer"),
+            contents: bytemuck::cast_slice(&[pos]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let position_bind_group_layout = Self::get_bind_group_layout(device);
+
+        let position_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &position_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: position_buffer.as_entire_binding(),
+            }],
+            label: Some("position_bind_group"),
+        });
+        println!("gpu-buffering time: {:?}", now.elapsed());
+
         Self {
-            position: position.into(),
-            yaw: yaw.into(),
-            pitch: pitch.into(),
-        }
-    }
-
-    pub fn calc_matrix(&self) -> Matrix4<f32> {
-        let (sin_pitch, cos_pitch) = self.pitch.0.sin_cos();
-        let (sin_yaw, cos_yaw) = self.yaw.0.sin_cos();
-
-        Matrix4::look_to_rh(
-            self.position,
-            Vector3::new(cos_pitch * cos_yaw, sin_pitch, cos_pitch * sin_yaw).normalize(),
-            Vector3::unit_y(),
-        )
-    }
-}
-
-impl Projection {
-    pub fn new<F: Into<Rad<f32>>>(width: u32, height: u32, fovy: F, znear: f32, zfar: f32) -> Self {
-        Self {
-            aspect: width as f32 / height as f32,
-            fovy: fovy.into(),
-            znear,
-            zfar,
-        }
-    }
-
-    pub fn resize(&mut self, width: u32, height: u32) {
-        self.aspect = width as f32 / height as f32;
-    }
-
-    pub fn calc_matrix(&self) -> Matrix4<f32> {
-        OPENGL_TO_WGPU_MATRIX * perspective(self.fovy, self.aspect, self.znear, self.zfar)
-    }
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct CameraUniform {
-    view_position: [f32; 4],
-    view_proj: [[f32; 4]; 4],
-}
-
-impl CameraUniform {
-    fn new() -> Self {
-        Self {
-            view_position: [0.0; 4],
-            view_proj: cgmath::Matrix4::identity().into(),
-        }
-    }
-
-    fn update_view_proj(&mut self, camera: &Camera, projection: &Projection) {
-        self.view_position = camera.position.to_homogeneous().into();
-        let cam_matrix = camera.calc_matrix();
-        self.view_proj = (projection.calc_matrix() * cam_matrix).into()
-    }
-}
-
-// TODO rewrite camera controller entirely
-#[derive(Debug)]
-pub struct CameraController {
-    amount_left: f32,
-    amount_right: f32,
-    amount_forward: f32,
-    amount_backward: f32,
-    amount_up: f32,
-    amount_down: f32,
-    rotate_horizontal: f32,
-    rotate_vertical: f32,
-    scroll: f32,
-    speed: f32,
-    sensitivity: f32,
-}
-
-// TODO why?
-const SAFE_FRAC_PI_2: f32 = FRAC_PI_2 - 0.0001;
-
-impl CameraController {
-    pub fn new(speed: f32, sensitivity: f32) -> Self {
-        Self {
-            amount_left: 0.0,
-            amount_right: 0.0,
-            amount_forward: 0.0,
-            amount_backward: 0.0,
-            amount_up: 0.0,
-            amount_down: 0.0,
-            rotate_horizontal: 0.0,
-            rotate_vertical: 0.0,
-            scroll: 0.0,
-            speed,
-            sensitivity,
-        }
-    }
-
-    pub fn process_keyboard(&mut self, key: KeyCode, state: ElementState) -> bool {
-        let amount = if state == ElementState::Pressed {
-            1.0
-        } else {
-            0.0
-        };
-        match key {
-            KeyCode::KeyW | KeyCode::ArrowUp => {
-                self.amount_forward = amount;
-                true
-            }
-            KeyCode::KeyS | KeyCode::ArrowDown => {
-                self.amount_backward = amount;
-                true
-            }
-            KeyCode::KeyA | KeyCode::ArrowLeft => {
-                self.amount_left = amount;
-                true
-            }
-            KeyCode::KeyD | KeyCode::ArrowRight => {
-                self.amount_right = amount;
-                true
-            }
-            KeyCode::Space => {
-                self.amount_up = amount;
-                true
-            }
-            KeyCode::ShiftLeft => {
-                self.amount_down = amount;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    pub fn process_mouse(&mut self, mouse_dx: f64, mouse_dy: f64) {
-        self.rotate_horizontal = mouse_dx as f32;
-        self.rotate_vertical = mouse_dy as f32;
-    }
-
-    pub fn process_scroll(&mut self, delta: &MouseScrollDelta) {
-        self.scroll = -match delta {
-            // I'm assuming a line is about 100 pixels
-            MouseScrollDelta::LineDelta(_, scroll) => scroll * 100.0,
-            MouseScrollDelta::PixelDelta(PhysicalPosition { y: scroll, .. }) => *scroll as f32,
-        };
-    }
-
-    pub fn update_camera(&mut self, camera: &mut Camera, dt: Duration) {
-        let dt = dt.as_secs_f32();
-
-        // Move forward/backward and left/right
-        let (yaw_sin, yaw_cos) = camera.yaw.0.sin_cos();
-        let forward = Vector3::new(yaw_cos, 0.0, yaw_sin).normalize();
-        let right = Vector3::new(-yaw_sin, 0.0, yaw_cos).normalize();
-        camera.position += forward * (self.amount_forward - self.amount_backward) * self.speed * dt;
-        camera.position += right * (self.amount_right - self.amount_left) * self.speed * dt;
-
-        // Move up/down. Since we don't use roll, we can just
-        // modify the y coordinate directly.
-        camera.position.y += (self.amount_up - self.amount_down) * self.speed * dt;
-
-        // Rotate
-        camera.yaw += Rad(self.rotate_horizontal) * self.sensitivity * dt;
-        camera.pitch += Rad(-self.rotate_vertical) * self.sensitivity * dt;
-
-        // If process_mouse isn't called every frame, these values
-        // will not get set to zero, and the camera will rotate
-        // when moving in a non-cardinal direction.
-        self.rotate_horizontal = 0.0;
-        self.rotate_vertical = 0.0;
-
-        // Keep the camera's angle from going too high/low.
-        if camera.pitch < -Rad(SAFE_FRAC_PI_2) {
-            camera.pitch = -Rad(SAFE_FRAC_PI_2);
-        } else if camera.pitch > Rad(SAFE_FRAC_PI_2) {
-            camera.pitch = Rad(SAFE_FRAC_PI_2);
+            vertices,
+            indices,
+            vertex_buffer,
+            index_buffer,
+            position_buffer,
+            bind_group: position_bind_group,
+            pos,
         }
     }
 }
@@ -232,8 +102,7 @@ struct State<'a> {
     // unsafe references to the window's resources.
     window: &'a Window,
     render_pipeline: wgpu::RenderPipeline,
-    vertex_buffer: wgpu::Buffer,
-    index_buffer: wgpu::Buffer,
+    chunks: Vec<Chunk>,
     diffuse_bind_group: wgpu::BindGroup,
 
     camera: Camera,
@@ -242,34 +111,9 @@ struct State<'a> {
     camera_bind_group: wgpu::BindGroup,
     camera_controller: CameraController,
     camera_uniform: CameraUniform,
-    num_vertices: usize, // TODO temp
     mouse_pressed: bool,
+    depth_texture: Texture,
 }
-
-const VERTICES: &[Vertex] = &[
-    Vertex {
-        position: [-0.0868241, 0.49240386, 0.0],
-        normal: [0.0, 0.4131759, 0.99240386],
-    }, // A
-    Vertex {
-        position: [-0.49513406, 0.06958647, 0.0],
-        normal: [0.0, 0.0048659444, 0.56958647],
-    }, // B
-    Vertex {
-        position: [-0.21918549, -0.44939706, 0.0],
-        normal: [0.0, 0.28081453, 0.05060294],
-    }, // C
-    Vertex {
-        position: [0.35966998, -0.3473291, 0.0],
-        normal: [0.0, 0.85967, 0.1526709],
-    }, // D
-    Vertex {
-        position: [0.44147372, 0.2347359, 0.0],
-        normal: [0.0, 0.9414737, 0.7347359],
-    }, // E
-];
-
-const INDICES: &[u16] = &[0, 1, 4, 1, 2, 4, 2, 3, 4];
 
 async fn make_adapter<'a>(instance: &wgpu::Instance, surface: &wgpu::Surface<'a>) -> wgpu::Adapter {
     instance
@@ -348,7 +192,13 @@ fn make_render_pipeline(
             unclipped_depth: false,
             conservative: false,
         },
-        depth_stencil: None,
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: texture::Texture::DEPTH_FORMAT,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
         multisample: wgpu::MultisampleState {
             count: 1,
             mask: !0,
@@ -441,20 +291,6 @@ impl<'a> State<'a> {
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
 
-        let (vertices, indices) = create_mesh();
-
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(&indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-
         let camera = Camera::new(Point3::new(0.0, 2.0, 1.0), Rad(0.0), Rad(0.0));
         let projection = Projection::new(
             /*width:*/ config.width,
@@ -505,8 +341,27 @@ impl<'a> State<'a> {
             &shader,
             vertex_buffer_layout,
             &config,
-            &[&texture_bind_group_layout, &camera_bind_group_layout],
+            &[
+                &texture_bind_group_layout,
+                &camera_bind_group_layout,
+                &Chunk::get_bind_group_layout(&device),
+            ],
         );
+
+        let depth_texture =
+            texture::Texture::create_depth_texture(&device, &config, "depth_texture");
+
+        let mut chunks = Vec::new();
+
+        for cx in 0..5 {
+            for cy in 0..5 {
+                let x = cx as f32 * 100.0;
+                let y = cy as f32 * 100.0;
+                let heightmap = create_heightmap([x, 0.0, y]);
+                let chunk = Chunk::new(&heightmap, [x, 0.0, y], &device);
+                chunks.push(chunk);
+            }
+        }
 
         Self {
             window: &window,
@@ -516,8 +371,6 @@ impl<'a> State<'a> {
             config,
             size,
             render_pipeline,
-            vertex_buffer,
-            index_buffer,
             diffuse_bind_group,
             camera,
             camera_buffer,
@@ -526,7 +379,8 @@ impl<'a> State<'a> {
             camera_controller,
             camera_uniform,
             mouse_pressed: false,
-            num_vertices: indices.len(),
+            chunks,
+            depth_texture,
         }
     }
 
@@ -539,6 +393,8 @@ impl<'a> State<'a> {
             self.projection.resize(self.size.width, self.size.height);
             // TODO update uniform
         }
+        self.depth_texture =
+            texture::Texture::create_depth_texture(&self.device, &self.config, "depth_texture");
     }
 
     fn input(&mut self, event: &WindowEvent) -> bool {
@@ -606,16 +462,27 @@ impl<'a> State<'a> {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_texture.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.diffuse_bind_group, &[]);
             render_pass.set_bind_group(1, &self.camera_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
-            render_pass.set_index_buffer(self.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            render_pass.draw_indexed(0..self.num_vertices as u32, 0, 0..1);
+            for chunk in &self.chunks {
+                render_pass.set_vertex_buffer(0, chunk.vertex_buffer.slice(..));
+                render_pass
+                    .set_index_buffer(chunk.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.set_bind_group(2, &chunk.bind_group, &[]);
+                render_pass.draw_indexed(0..chunk.indices.len() as u32, 0, 0..1);
+            }
         }
 
         // submit will accept anything that implements IntoIter
@@ -625,24 +492,24 @@ impl<'a> State<'a> {
         Ok(())
     }
 }
-fn noise_fract(x: f64, y: f64, octaves: usize, gen: &Perlin) -> f64 {
+fn noise_fract(x: f32, y: f32, octaves: usize, gen: &Perlin) -> f32 {
     let mut acc = 0.0;
     let lacunarity = 2.0;
-    let gain = 0.5;
+    let gain = 0.4;
     let mut amplitude = 0.5;
     let mut frequency = 1.;
     for i in 1..octaves {
         // acc = acc
         //     + gen.get([
-        //         x / (2.0f64.powf(i as f64)) + i as f64 * 1000.0,
-        //         y / (2.0f64.powf(i as f64)) + i as f64 * 1000.0,
-        //     ]) * i as f64;
+        //         x / (2.0f32.powf(i as f32)) + i as f32 * 1000.0,
+        //         y / (2.0f32.powf(i as f32)) + i as f32 * 1000.0,
+        //     ]) * i as f32;
 
         acc += amplitude
             * gen.get([
-                frequency * x + i as f64 * 1000.0,
-                frequency * y + i as f64 * 1000.0,
-            ]);
+                (frequency * x + i as f32 * 1000.0) as f64,
+                (frequency * y + i as f32 * 1000.0) as f64,
+            ]) as f32;
         frequency *= lacunarity;
         amplitude *= gain;
     }
@@ -655,36 +522,90 @@ fn vec_addeq(a: &mut [f32], b: &[f32]) {
     a[2] += b[2];
 }
 
-fn create_mesh() -> (Vec<Vertex>, Vec<u32>) {
+fn sample_bilinear(heightmap: &[Vec<f32>], pos: [f32; 2]) -> (f32, [f32; 2]) {
+    let (x, y) = (pos[0], pos[1]);
+    let dx = x - x.floor();
+    let dy = y - y.floor();
+
+    let (hx, hy) = (x.floor() as usize, y.floor() as usize);
+
+    let h00 = heightmap[hy][hx];
+    let h01 = heightmap[hy + 1][hx];
+    let h10 = heightmap[hy][hx + 1];
+    let h11 = heightmap[hy + 1][hx + 1];
+
+    let grad = [
+        (h01 - h00) * (1.0 - dy) + (h11 - h10) * dy,
+        (h10 - h00) * (1.0 - dx) + (h11 - h01) * dx,
+    ];
+
+    let sample = h00 * (1.0 - dx) * (1.0 - dy)
+        + h01 * dy * (1.0 - dx)
+        + h10 * (1.0 - dy) * dx
+        + h11 * dx * dy;
+    (sample, grad)
+}
+
+fn add_bilinear(heightmap: &mut [Vec<f32>], pos: [f32; 2], amt: f32) {
+    let (x, y) = (pos[0], pos[1]);
+    let dx = x - x.floor();
+    let dy = y - y.floor();
+
+    let (hx, hy) = (x.floor() as usize, y.floor() as usize);
+    heightmap[hy][hx] += amt * (1.0 - dx) * (1.0 - dy);
+    heightmap[hy + 1][hx] += amt * dy * (1.0 - dx);
+    heightmap[hy][hx + 1] += amt * (1.0 - dy) * dx;
+    heightmap[hy + 1][hx + 1] += amt * dx * dy;
+}
+
+fn create_heightmap(pos: [f32; 3]) -> Vec<Vec<f32>> {
+    let now = std::time::Instant::now();
     let noise = Perlin::new(1);
-    let rad = 300;
-    let scl = 5;
+    let rad = 100;
+    let init_heightmap = (0..rad)
+        .map(|y| {
+            (0..rad)
+                .map(|x| {
+                    noise_fract(
+                        (x as f32 + pos[0]) / 168.0,
+                        (y as f32 + pos[2]) / 168.0,
+                        10,
+                        &noise,
+                    ) as f32
+                        / 0.01
+                })
+                .collect()
+        })
+        .collect();
+    println!("Heightmap creation: {:?}", now.elapsed());
+    init_heightmap
+}
+
+fn create_mesh(heightmap: &[Vec<f32>]) -> (Vec<Vertex>, Vec<u32>) {
     let mut vertices = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
-    for y in 0..rad {
-        for x in 0..rad {
+    let width = heightmap[0].len();
+    let height = heightmap.len();
+    for y in 0..height {
+        for x in 0..width {
             vertices.push(Vertex {
-                position: [
-                    x as f32 / scl as f32 - 0.5,
-                    noise_fract(x as f64 / 68.0, y as f64 / 68.0, 10, &noise) as f32 / 0.2,
-                    y as f32 / scl as f32 - 0.5,
-                ],
-                normal: [1.0, 0.0, 0.0],
+                position: [x as f32, heightmap[y][x], y as f32],
+                normal: [0.0, 0.0, 0.0],
             });
 
             // skip last point in each row or col as it has already been included in a triangle
-            if x == rad - 1 || y == rad - 1 {
+            if x == height - 1 || y == width - 1 {
                 continue;
             }
             // quad: 6 vertices
             // first tri
-            indices.push((y + 1) * rad + x + 1);
-            indices.push(y * rad + x + 1);
-            indices.push(y * rad + x);
+            indices.push(((y + 1) * width + x + 1) as u32);
+            indices.push((y * width + x + 1) as u32);
+            indices.push((y * width + x) as u32);
             // second tri
-            indices.push((y + 1) * rad + x);
-            indices.push((y + 1) * rad + x + 1);
-            indices.push(y * rad + x);
+            indices.push(((y + 1) * width + x) as u32);
+            indices.push(((y + 1) * width + x + 1) as u32);
+            indices.push((y * width + x) as u32);
         }
     }
 
@@ -695,6 +616,7 @@ fn create_mesh() -> (Vec<Vertex>, Vec<u32>) {
         let vc = &vertices[c as usize].position;
         let (a1, a2, a3) = (vb[0] - va[0], vb[1] - va[1], vb[2] - va[1]);
         let (b1, b2, b3) = (vc[0] - va[0], vc[1] - va[1], vc[2] - va[1]);
+        // cross product
         let face_normal = [a2 * b3 - a3 * b2, a3 * b1 - a1 * b3, a1 * b2 - a2 * b1];
         vec_addeq(&mut vertices[a as usize].normal, &face_normal);
         vec_addeq(&mut vertices[b as usize].normal, &face_normal);
@@ -703,9 +625,7 @@ fn create_mesh() -> (Vec<Vertex>, Vec<u32>) {
 
     for vertex in &mut vertices {
         let inv_len = 1.0
-            / (vertex.normal[0] * vertex.normal[0]
-                + vertex.normal[1] * vertex.normal[1]
-                + vertex.normal[2] * vertex.normal[2])
+            / (vertex.normal[0].powi(2) + vertex.normal[1].powi(2) + vertex.normal[2].powi(2))
                 .sqrt();
         vertex.normal[0] *= inv_len;
         vertex.normal[1] *= inv_len;
@@ -716,11 +636,37 @@ fn create_mesh() -> (Vec<Vertex>, Vec<u32>) {
 }
 
 async fn run() {
+    // let mut map: Vec<Vec<f32>> = vec![
+    //     vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    //     vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    //     vec![0.0, 0.0, 1.0, 1.0, 0.0, 0.0],
+    //     vec![0.0, 0.0, 1.0, 1.0, 0.0, 0.0],
+    //     vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    //     vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    // ];
+    // add_bilinear(&mut map, [0.5, 0.5], 1.0);
+    // let chars = [' ', '.', ':', '*', 'O', '%', '#'];
+
+    // let scl = 1;
+    // for y in 0..5 * scl {
+    //     for x in 0..5 * scl {
+    //         let (nx, ny) = (x as f32 / scl as f32, y as f32 / scl as f32);
+    //         // let n = map[y][x];
+    //         // println!("{nx},{ny}");
+    //         let n = sample_bilinear(&map, [nx, ny]);
+    //         // println!("{n}");
+    //         print!("{}", chars[(n * (chars.len() - 1) as f32).floor() as usize]);
+    //         print!("{}", chars[(n * (chars.len() - 1) as f32).floor() as usize]);
+    //     }
+    //     println!();
+    // }
+
     let event_loop = EventLoop::new().expect("Unable to create event loop!");
     let window = WindowBuilder::new().build(&event_loop).unwrap();
 
     let mut state = State::new(&window).await;
     let mut last_render_time = std::time::Instant::now();
+    let mut last_print_time = std::time::Instant::now();
     event_loop
         .run(move |event, elwt| match event {
             Event::DeviceEvent {
@@ -742,6 +688,10 @@ async fn run() {
                             let now = std::time::Instant::now();
                             let dt = now - last_render_time;
                             last_render_time = now;
+                            if last_print_time.elapsed().as_millis() > 500 {
+                                last_print_time = now;
+                                println!("{:?}", dt);
+                            }
                             state.update(dt);
                             match state.render() {
                                 Ok(_) => {}
