@@ -38,6 +38,7 @@ var<uniform> camera: CameraUniform;
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // return textureSample(t_diffuse, s_diffuse, in.uv);
-    var normal = normalize(in.normal);
-    return vec4(normal / 2.0 + vec3(0.5, 0.5, 0.5), 1.0);
+    // var normal = normalize(in.normal);
+    // return vec4(normal / 2.0 + vec3(0.5, 0.5, 0.5), 1.0);
+    return vec4(in.normal, 1.0);
 }
