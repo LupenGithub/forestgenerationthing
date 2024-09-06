@@ -27,6 +27,8 @@ struct Chunk {
     pos: [f32; 3],
 }
 
+const CHUNK_RAD: usize = 512;
+
 impl Chunk {
     fn get_bind_group_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
         device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -317,7 +319,7 @@ impl<'a> State<'a> {
             /*zfar:*/ 100.0,
         );
 
-        let camera_controller = CameraController::new(10.0, 4.0);
+        let camera_controller = CameraController::new(100.0, 4.0);
 
         let mut camera_uniform = CameraUniform::new();
         camera_uniform.update_view_proj(&camera, &projection);
@@ -372,8 +374,8 @@ impl<'a> State<'a> {
 
         for cx in 0..1 {
             for cy in 0..1 {
-                let x = cx as f32 * 100.0;
-                let y = cy as f32 * 100.0;
+                let x = cx as f32 * CHUNK_RAD as f32;
+                let y = cy as f32 * CHUNK_RAD as f32;
                 let (heightmap, vertices, indices) = create_heightmap([x, 0.0, y]);
                 let chunk = Chunk::new(&heightmap, [x, 0.0, y], &device, vertices, indices);
                 chunks.push(chunk);
@@ -575,41 +577,62 @@ fn add_bilinear(heightmap: &mut [Vec<(f32, [f32; 3])>], pos: [f32; 2], amt: f32)
 
     let (hx, hy) = (x.floor() as usize, y.floor() as usize);
     heightmap[hy][hx].0 += amt * (1.0 - dx) * (1.0 - dy);
-    heightmap[hy + 1][hx].0 += amt * dy * (1.0 - dx);
-    heightmap[hy][hx + 1].0 += amt * (1.0 - dy) * dx;
+    heightmap[hy][hx + 1].0 += amt * dx * (1.0 - dy);
+    heightmap[hy + 1][hx].0 += amt * (1.0 - dx) * dy;
     heightmap[hy + 1][hx + 1].0 += amt * dx * dy;
 }
 
 fn create_heightmap(pos: [f32; 3]) -> (Vec<Vec<(f32, [f32; 3])>>, Vec<Vertex>, Vec<u32>) {
     let now = std::time::Instant::now();
     let noise = Perlin::new(1);
-    let rad = 100;
-    let mut heightmap = (0..rad)
+    let heightmap = (0..CHUNK_RAD)
         .map(|y| {
-            (0..rad)
+            (0..CHUNK_RAD)
                 .map(|x| {
                     (
                         noise_fract(
-                            (x as f32 + pos[0]) / 168.0,
-                            (y as f32 + pos[2]) / 168.0,
+                            (x as f32 + pos[0]) / 290.0,
+                            (y as f32 + pos[2]) / 290.0,
                             10,
                             &noise,
-                        ) as f32
-                            / 0.01,
+                        ) as f32,
                         [0.0, 0.0, 0.0],
                     )
                 })
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+
+    // todo shit, normalise heightmap
+    let min_height = heightmap
+        .iter()
+        .map(|x| x.iter())
+        .flatten()
+        .fold(f32::NAN, |a, b| a.min(b.0));
+    let max_height = heightmap
+        .iter()
+        .map(|x| x.iter())
+        .flatten()
+        .fold(f32::NAN, |a, b| a.max(b.0));
+
+    let mut heightmap = heightmap
+        .iter()
+        .map(|x| {
+            x.iter()
+                .map(|y| ((y.0 - min_height) / (max_height - min_height), y.1))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
     println!("Heightmap creation: {:?}", now.elapsed());
+
     let now = std::time::Instant::now();
     for y in 0..heightmap.len() - 1 {
         for x in 0..heightmap[y].len() - 1 {
             let (height, grad) = sample_bilinear(&heightmap, [x as f32, y as f32]);
             let new_pos = [x as f32 + grad[0], y as f32 + grad[0]];
-            let asdf = if new_pos[0] >= (rad - 1) as f32
-                || new_pos[1] >= (rad - 1) as f32
+            let asdf = if new_pos[0] >= (CHUNK_RAD - 1) as f32
+                || new_pos[1] >= (CHUNK_RAD - 1) as f32
                 || new_pos[0] <= 0.0
                 || new_pos[1] <= 0.0
             {
@@ -625,28 +648,34 @@ fn create_heightmap(pos: [f32; 3]) -> (Vec<Vec<(f32, [f32; 3])>>, Vec<Vertex>, V
     let mut rng = rand::thread_rng();
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
-    for _ in 0..5000 {
+    for _ in 0..3000000 {
+        // println!("New drop");
         let mut drop_pos = [
-            rng.gen::<f32>() * (rad - 1) as f32,
-            rng.gen::<f32>() * (rad - 1) as f32,
+            rng.gen::<f32>() * (CHUNK_RAD - 1) as f32,
+            rng.gen::<f32>() * (CHUNK_RAD - 1) as f32,
         ];
         let mut water_volume = 1.0;
         let mut sediment_volume = 0.0;
         let mut speed = 1.0;
+        let mut dir = [0.0, 0.0];
+        const INERTIA: f32 = 0.05;
 
         let mut started_drawing = false;
         while water_volume > 0.3 {
-            let (height, mut gradient) = sample_bilinear(&heightmap, drop_pos);
-            let len = gradient[0].powi(2) + gradient[1].powi(2);
-            if len != 0.0 {
-                let inv_len = 1.0 / len;
-                gradient[0] *= inv_len;
-                gradient[1] *= inv_len;
+            let init_drop_pos = drop_pos;
+            let (height, gradient) = sample_bilinear(&heightmap, drop_pos);
+            dir[0] = dir[0] * INERTIA - gradient[0] * (1.0 - INERTIA);
+            dir[1] = dir[1] * INERTIA - gradient[1] * (1.0 - INERTIA);
+            let magnitude = f32::sqrt(dir[0] * dir[0] + dir[1] * dir[1]);
+            if magnitude > 0.0 {
+                dir[0] /= magnitude;
+                dir[1] /= magnitude;
             }
-            drop_pos[0] -= gradient[0];
-            drop_pos[1] -= gradient[1];
-            if drop_pos[0] >= (rad - 1) as f32
-                || drop_pos[1] >= (rad - 1) as f32
+            drop_pos[0] += dir[0];
+            drop_pos[1] += dir[1];
+            if (dir[0] == 0.0 && dir[1] == 0.0)
+                || drop_pos[0] >= (CHUNK_RAD - 1) as f32
+                || drop_pos[1] >= (CHUNK_RAD - 1) as f32
                 || drop_pos[0] <= 0.0
                 || drop_pos[1] <= 0.0
             {
@@ -654,10 +683,20 @@ fn create_heightmap(pos: [f32; 3]) -> (Vec<Vec<(f32, [f32; 3])>>, Vec<Vertex>, V
             }
 
             let (new_height, _) = sample_bilinear(&heightmap, drop_pos);
-            let delta_height = height - new_height;
+            let delta_height = new_height - height;
 
-            let sediment_capacity = f32::max(delta_height * speed * water_volume * 4.0, 0.01);
-            if sediment_volume > sediment_capacity {
+            let sediment_capacity = f32::max(-delta_height * speed * water_volume * 4.0, 0.01);
+            // println!(
+            //     "dir={:?} pos={:?} svol={} scap={} wvol={} spd={} dh={}",
+            //     dir,
+            //     drop_pos,
+            //     sediment_volume,
+            //     sediment_capacity,
+            //     water_volume,
+            //     speed,
+            //     delta_height
+            // );
+            if sediment_volume > sediment_capacity || delta_height > 0.0 {
                 // deposit
                 let deposit_quantity = if delta_height > 0.0 {
                     f32::min(sediment_volume, delta_height)
@@ -665,38 +704,47 @@ fn create_heightmap(pos: [f32; 3]) -> (Vec<Vec<(f32, [f32; 3])>>, Vec<Vertex>, V
                     (sediment_volume - sediment_capacity) * 0.3
                 };
 
-                add_bilinear(&mut heightmap, drop_pos, deposit_quantity);
+                // println!("dq={}", deposit_quantity);
+
+                add_bilinear(&mut heightmap, init_drop_pos, deposit_quantity);
                 sediment_volume -= deposit_quantity;
             } else {
                 // erode
-                // delta height is likely negative (I think?)
                 let erode_quantity =
                     f32::min((sediment_capacity - sediment_volume) * 0.3, -delta_height);
                 sediment_volume += erode_quantity;
-                add_bilinear(&mut heightmap, drop_pos, -erode_quantity);
+                // println!(
+                //     "eq={} scap={} svol={} dh={}",
+                //     erode_quantity, sediment_capacity, sediment_volume, delta_height
+                // );
+                add_bilinear(&mut heightmap, init_drop_pos, -erode_quantity);
             }
 
-            if started_drawing {
-                let last = vertices.len() as u32 - 2;
-                indices.push(last);
-                indices.push(last + 1);
-                indices.push(last + 2);
-                indices.push(last + 2);
-                indices.push(last + 3);
-                indices.push(last + 1);
-            }
-            let normal = [0.0, sediment_capacity, 0.0];
+            // if started_drawing {
+            //     let last = vertices.len() as u32 - 2;
+            //     indices.push(last);
+            //     indices.push(last + 1);
+            //     indices.push(last + 2);
+            //     indices.push(last + 2);
+            //     indices.push(last + 3);
+            //     indices.push(last + 1);
+            // }
+            // let normal = [0.0, (water_volume - 0.3) * 1.42, 0.0];
             // started_drawing = true;
-            vertices.push(Vertex {
-                position: [drop_pos[0], height + 1.0, drop_pos[1]],
-                normal,
-            });
-            vertices.push(Vertex {
-                position: [drop_pos[0] + 0.5, height + 1.0, drop_pos[1] + 0.5],
-                normal,
-            });
-            water_volume *= 0.97; // 0.99
+            // vertices.push(Vertex {
+            //     position: [drop_pos[0], height + 1.0, drop_pos[1]],
+            //     normal,
+            // });
+            // vertices.push(Vertex {
+            //     position: [drop_pos[0] + 0.5, height + 1.0, drop_pos[1] + 0.5],
+            //     normal,
+            // });
+            water_volume *= 0.98; // 0.99
             speed = f32::sqrt(speed * speed + delta_height * 4.0);
+            // if speed.is_nan() {
+            //     speed = 1.0;
+            // }
+            // println!("{} {}", speed, delta_height);
         }
     }
     println!("Erosion: {:?}", now.elapsed());
@@ -707,15 +755,15 @@ fn create_heightmap(pos: [f32; 3]) -> (Vec<Vec<(f32, [f32; 3])>>, Vec<Vertex>, V
 fn create_mesh(heightmap: &[Vec<(f32, [f32; 3])>]) -> (Vec<Vertex>, Vec<u32>) {
     let mut vertices = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
-    let mut n_vertices = Vec::new();
-    let mut n_indices: Vec<u32> = Vec::new();
+    // let mut n_vertices = Vec::new();
+    // let mut n_indices: Vec<u32> = Vec::new();
     let width = heightmap[0].len();
     let height = heightmap.len();
     for y in 0..height {
         for x in 0..width {
             vertices.push(Vertex {
-                position: [x as f32, heightmap[y][x].0, y as f32],
-                normal: heightmap[y][x].1,
+                position: [x as f32, heightmap[y][x].0 * 170.0, y as f32],
+                normal: [0.0, 0.0, 0.0], //heightmap[y][x].1,
             });
 
             // skip last point in each row or col as it has already been included in a triangle
@@ -733,61 +781,63 @@ fn create_mesh(heightmap: &[Vec<(f32, [f32; 3])>]) -> (Vec<Vertex>, Vec<u32>) {
             indices.push((y * width + x) as u32);
 
             // normal visualisation
-            n_vertices.push(Vertex {
-                position: [x as f32, heightmap[y][x].0, y as f32],
-                normal: [0.0, 0.0, 0.0],
-            });
-            n_vertices.push(Vertex {
-                position: [x as f32, heightmap[y][x].0, y as f32 + 0.2],
-                normal: [1.0, 0.0, 0.0],
-            });
-            n_vertices.push(Vertex {
-                position: [
-                    x as f32 + heightmap[y][x].1[0] * 3.0,
-                    heightmap[y][x].0 + heightmap[y][x].1[1] * 3.0,
-                    y as f32 + heightmap[y][x].1[2] * 3.0,
-                ],
-                normal: [0.0, 1.0, 0.0],
-            });
-            n_vertices.push(Vertex {
-                position: [
-                    x as f32 + heightmap[y][x].1[0] * 3.0,
-                    heightmap[y][x].0 + heightmap[y][x].1[1] * 3.0,
-                    y as f32 + heightmap[y][x].1[2] * 3.0 + 0.2,
-                ],
-                normal: [0.0, 0.0, 1.0],
-            });
+            // n_vertices.push(Vertex {
+            //     position: [x as f32, heightmap[y][x].0, y as f32],
+            //     normal: [0.0, 0.0, 0.0],
+            // });
+            // n_vertices.push(Vertex {
+            //     position: [x as f32, heightmap[y][x].0, y as f32 + 0.2],
+            //     normal: [1.0, 0.0, 0.0],
+            // });
+            // n_vertices.push(Vertex {
+            //     position: [
+            //         x as f32 + heightmap[y][x].1[0] * 3.0,
+            //         heightmap[y][x].0 + heightmap[y][x].1[1] * 3.0,
+            //         y as f32 + heightmap[y][x].1[2] * 3.0,
+            //     ],
+            //     normal: [0.0, 1.0, 0.0],
+            // });
+            // n_vertices.push(Vertex {
+            //     position: [
+            //         x as f32 + heightmap[y][x].1[0] * 3.0,
+            //         heightmap[y][x].0 + heightmap[y][x].1[1] * 3.0,
+            //         y as f32 + heightmap[y][x].1[2] * 3.0 + 0.2,
+            //     ],
+            //     normal: [0.0, 0.0, 1.0],
+            // });
 
-            let l = n_vertices.len() as u32 - 4;
-            n_indices.extend([l, l + 1, l + 2, l + 1, l + 2, l + 3].iter());
+            // let l = n_vertices.len() as u32 - 4;
+            // n_indices.extend([l, l + 1, l + 2, l + 1, l + 2, l + 3].iter());
         }
     }
 
     let next_index = vertices.len();
     // vertices.append(&mut n_vertices);
     // indices.extend(n_indices.iter().map(|index| index + next_index as u32));
-    // for tri in indices.chunks(3) {
-    //     let (a, b, c) = (tri[0], tri[1], tri[2]);
-    //     let va = &vertices[a as usize].position;
-    //     let vb = &vertices[b as usize].position;
-    //     let vc = &vertices[c as usize].position;
-    //     let (a1, a2, a3) = (vb[0] - va[0], vb[1] - va[1], vb[2] - va[1]);
-    //     let (b1, b2, b3) = (vc[0] - va[0], vc[1] - va[1], vc[2] - va[1]);
-    //     // cross product
-    //     let face_normal = [a2 * b3 - a3 * b2, a3 * b1 - a1 * b3, a1 * b2 - a2 * b1];
-    //     vec_addeq(&mut vertices[a as usize].normal, &face_normal);
-    //     vec_addeq(&mut vertices[b as usize].normal, &face_normal);
-    //     vec_addeq(&mut vertices[c as usize].normal, &face_normal);
-    // }
 
-    // for vertex in &mut vertices {
-    //     let inv_len = 1.0
-    //         / (vertex.normal[0].powi(2) + vertex.normal[1].powi(2) + vertex.normal[2].powi(2))
-    //             .sqrt();
-    //     vertex.normal[0] *= inv_len;
-    //     vertex.normal[1] *= inv_len;
-    //     vertex.normal[2] *= inv_len;
-    // }
+    // calculate normals
+    for tri in indices.chunks(3) {
+        let (a, b, c) = (tri[0], tri[1], tri[2]);
+        let va = &vertices[a as usize].position;
+        let vb = &vertices[b as usize].position;
+        let vc = &vertices[c as usize].position;
+        let (a1, a2, a3) = (vb[0] - va[0], vb[1] - va[1], vb[2] - va[1]);
+        let (b1, b2, b3) = (vc[0] - va[0], vc[1] - va[1], vc[2] - va[1]);
+        // cross product
+        let face_normal = [a2 * b3 - a3 * b2, a3 * b1 - a1 * b3, a1 * b2 - a2 * b1];
+        vec_addeq(&mut vertices[a as usize].normal, &face_normal);
+        vec_addeq(&mut vertices[b as usize].normal, &face_normal);
+        vec_addeq(&mut vertices[c as usize].normal, &face_normal);
+    }
+
+    for vertex in &mut vertices {
+        let inv_len = 1.0
+            / (vertex.normal[0].powi(2) + vertex.normal[1].powi(2) + vertex.normal[2].powi(2))
+                .sqrt();
+        vertex.normal[0] *= inv_len;
+        vertex.normal[1] *= inv_len;
+        vertex.normal[2] *= inv_len;
+    }
 
     (vertices, indices)
 }
