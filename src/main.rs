@@ -553,15 +553,10 @@ fn sample_bilinear(heightmap: &[Vec<(f32, [f32; 3])>], pos: [f32; 2]) -> (f32, [
     let h10 = heightmap[hy][hx + 1].0;
     let h11 = heightmap[hy + 1][hx + 1].0;
 
-    let mut grad = [
-        // (h01 - h00) * (1.0 - dy) + (h11 - h10) * dy,
-        // (h10 - h00) * (1.0 - dx) + (h11 - h01) * dx,
+    let grad = [
         (h10 - h00) * (1.0 - dy) + (h11 - h01) * dy,
         (h01 - h00) * (1.0 - dx) + (h11 - h10) * dx,
     ];
-    // let inv_len = 1.0 / (grad[0].powi(2) + grad[1].powi(2)).sqrt();
-    // grad[0] *= inv_len;
-    // grad[1] *= inv_len;
 
     let sample = h00 * (1.0 - dx) * (1.0 - dy)
         + h01 * dy * (1.0 - dx)
@@ -645,6 +640,27 @@ fn create_heightmap(pos: [f32; 3]) -> (Vec<Vec<(f32, [f32; 3])>>, Vec<Vertex>, V
         }
     }
 
+    // precalculate weights
+    let weights_radius: isize = 3;
+    let weights_size = weights_radius * 2 + 1;
+    let mut weights = vec![0.0f32; (weights_size * weights_size) as usize];
+    let mut sum = 0.0f32;
+    for y in -weights_radius..=weights_radius {
+        for x in -weights_radius..=weights_radius {
+            let cx = weights_radius + x;
+            let cy = weights_radius + y;
+            let dd = x * x + y * y;
+            if dd < weights_radius * weights_radius {
+                let weight = 1.0 - (dd as f32).sqrt() / weights_radius as f32;
+                weights[(cy * weights_size + cx) as usize] = weight;
+                sum += weight;
+            }
+        }
+    }
+    for w in &mut weights {
+        *w /= sum;
+    }
+
     let mut rng = rand::thread_rng();
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
@@ -717,7 +733,37 @@ fn create_heightmap(pos: [f32; 3]) -> (Vec<Vec<(f32, [f32; 3])>>, Vec<Vertex>, V
                 //     "eq={} scap={} svol={} dh={}",
                 //     erode_quantity, sediment_capacity, sediment_volume, delta_height
                 // );
-                add_bilinear(&mut heightmap, init_drop_pos, -erode_quantity);
+                // add_bilinear(&mut heightmap, init_drop_pos, -erode_quantity);
+                let offset = weights_radius;
+                for y in -weights_radius..=weights_radius {
+                    for x in -weights_radius..=weights_radius {
+                        let weight_coord_x = offset + x;
+                        let weight_coord_y = offset + y;
+
+                        let map_coord_x = (init_drop_pos[0] + x as f32) as isize;
+                        let map_coord_y = (init_drop_pos[1] + y as f32) as isize;
+
+                        // check if coord is in heightmap
+                        if (map_coord_x >= 0 && map_coord_x < CHUNK_RAD as isize)
+                            && (map_coord_y >= 0 && map_coord_y < CHUNK_RAD as isize)
+                        {
+                            let weight =
+                                weights[(weight_coord_y * weights_size + weight_coord_x) as usize];
+                            let weighted_erode_amount = weight * erode_quantity;
+                            let delta_sediment =
+                                if heightmap[map_coord_y as usize][map_coord_x as usize].0
+                                    < weighted_erode_amount
+                                {
+                                    heightmap[map_coord_y as usize][map_coord_x as usize].0
+                                } else {
+                                    weighted_erode_amount
+                                };
+
+                            heightmap[map_coord_y as usize][map_coord_x as usize].0 -=
+                                delta_sediment;
+                        }
+                    }
+                }
             }
 
             // if started_drawing {
